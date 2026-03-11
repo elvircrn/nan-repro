@@ -2,7 +2,7 @@
 """
 Test 7: Chained MoE layers with fixed batch — tests 2, 4, 8, 16 layers.
 Each layer's output feeds the next. All layers share one deep_ep.Buffer.
-Uses use_fp8_dispatch=True to match production NVSHMEM dispatch path.
+Uses NVFP4 + FlashInfer CuteDSL masked_gemm + fp8 dispatch (production path).
 Tests whether buffer reuse / handle state across layers causes NaN.
 """
 import sys, os
@@ -37,37 +37,32 @@ def main():
     expert_map[e_start:e_start + num_local_experts] = torch.arange(num_local_experts, dtype=torch.int32)
     expert_map = expert_map.to(device=device)
 
+    moe_config = make_moe_config()
     total_fails = 0
 
     for n_layers in LAYER_COUNTS:
-        # Create fresh context manager each iteration (single-use generator)
         vllm_ctx = set_current_vllm_config(VllmConfig())
         with vllm_ctx:
             if rank == 0:
                 print(f"\n=== Chained fixed: {n_layers} layers, bs={BATCH_SIZE}, {REPLAYS} replays ===", flush=True)
 
-            # Create shared buffer + per-layer a2a/experts/weights
+            # Create shared buffer
             num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
                 BATCH_SIZE, HIDDEN_SIZE, world_size, NUM_EXPERTS)
             shared_buffer = deep_ep.Buffer(
                 group=pg, num_rdma_bytes=num_rdma_bytes,
                 low_latency_mode=True, num_qps_per_rank=num_local_experts)
 
-            quant_config = FusedMoEQuantConfig.make(None)
-            moe_config = make_dummy_moe_config()
-
+            # Per-layer: a2a + FlashInfer CuteDSL experts + nvfp4 weights
             layers = []
             all_w1 = []
             all_w2 = []
             for _ in range(n_layers):
-                a2a = DeepEPLLPrepareAndFinalize(
-                    buffer=shared_buffer, num_dispatchers=world_size,
-                    max_tokens_per_rank=BATCH_SIZE, use_fp8_dispatch=True)
-                experts = BatchedTritonExperts(
-                    max_num_tokens=BATCH_SIZE, num_dispatchers=world_size,
-                    moe_config=moe_config, quant_config=quant_config)
-                mk = FusedMoEKernel(prepare_finalize=a2a, fused_experts=experts, inplace=False)
-                w1, w2 = make_weights(num_local_experts, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+                mk, w1, w2 = make_moe_layer(
+                    buffer=shared_buffer, world_size=world_size,
+                    max_tokens_per_rank=BATCH_SIZE,
+                    num_local_experts=num_local_experts,
+                    moe_config=moe_config)
                 layers.append(mk)
                 all_w1.append(w1)
                 all_w2.append(w2)
@@ -120,7 +115,6 @@ def main():
             if nan_count > 0:
                 total_fails += 1
 
-            # Clean up GPU memory for next layer count
             del graph, graph_out, layers, all_w1, all_w2, shared_buffer
             torch.cuda.empty_cache()
 

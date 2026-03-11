@@ -1,6 +1,12 @@
 """
 Shared setup for DeepEP CUDA graph tests.
 Not run directly — imported by test_*.py scripts.
+
+Uses the production NVFP4 + FlashInfer CuteDSL masked_gemm path:
+  - NVFP4 dispatch via DeepEPLLPrepareAndFinalize (use_nvfp4=True in dispatch)
+  - FlashInferCuteDSLExperts (not BatchedTritonExperts)
+  - nvfp4 quant config with swizzled block scales
+  - uint8 packed FP4 weights
 """
 import os
 import sys
@@ -17,12 +23,18 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
+    nvfp4_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.deepep_ll_prepare_finalize import (
     DeepEPLLPrepareAndFinalize,
 )
-from vllm.model_executor.layers.fused_moe.fused_batched_moe import BatchedTritonExperts
+from vllm.model_executor.layers.fused_moe.flashinfer_cutedsl_moe import (
+    FlashInferCuteDSLExperts,
+)
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    swizzle_blockscale,
+)
 from vllm.v1.worker.workspace import init_workspace_manager
 
 # DeepSeek-R1 config
@@ -34,14 +46,14 @@ MAX_TOKENS_PER_RANK = 64
 NUM_REPLAYS = 200
 
 
-def make_dummy_moe_config():
+def make_moe_config():
     return FusedMoEConfig(
-        num_experts=1,
-        experts_per_token=1,
-        hidden_dim=1,
-        intermediate_size_per_partition=1,
-        num_local_experts=1,
-        num_logical_experts=1,
+        num_experts=NUM_EXPERTS,
+        experts_per_token=TOPK,
+        hidden_dim=HIDDEN_SIZE,
+        intermediate_size_per_partition=INTERMEDIATE_SIZE,
+        num_local_experts=NUM_EXPERTS,  # set at config level, EP handled by a2a
+        num_logical_experts=NUM_EXPERTS,
         moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
         activation=MoEActivation.SILU,
         in_dtype=torch.bfloat16,
@@ -51,7 +63,7 @@ def make_dummy_moe_config():
 
 
 def make_deepep_ll_a2a(pg, world_size, num_experts, max_tokens_per_rank,
-                        hidden_size, use_fp8_dispatch=False):
+                        hidden_size):
     num_local_experts = num_experts // world_size
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
         max_tokens_per_rank, hidden_size, world_size, num_experts,
@@ -62,18 +74,100 @@ def make_deepep_ll_a2a(pg, world_size, num_experts, max_tokens_per_rank,
         low_latency_mode=True,
         num_qps_per_rank=num_local_experts,
     )
-    return DeepEPLLPrepareAndFinalize(
+    return buffer, DeepEPLLPrepareAndFinalize(
         buffer=buffer,
         num_dispatchers=world_size,
         max_tokens_per_rank=max_tokens_per_rank,
-        use_fp8_dispatch=use_fp8_dispatch,
+        use_fp8_dispatch=False,  # NVFP4 dispatch replaces FP8; mutually exclusive in DeepEP
     )
 
 
-def make_weights(num_experts, n, k, dtype=torch.bfloat16):
-    w1 = torch.randn((num_experts, 2 * n, k), device="cuda", dtype=dtype) / 10
-    w2 = torch.randn((num_experts, k, n), device="cuda", dtype=dtype) / 10
-    return w1, w2
+def make_nvfp4_weights(num_local_experts, intermediate_size, hidden_size):
+    """Create synthetic NVFP4 weights matching production format.
+    w1: [E, 2*N, K//2] uint8 (gate+up fused, FP4 packed)
+    w2: [E, K, N//2] uint8
+    w1_scale: [E, 2*N, K//16] float8_e4m3fn (block scales, swizzled)
+    w2_scale: [E, K, N//16] float8_e4m3fn (block scales, swizzled)
+    """
+    N = intermediate_size
+    K = hidden_size
+
+    w1 = torch.randint(0, 256, (num_local_experts, 2 * N, K // 2),
+                       device="cuda", dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (num_local_experts, K, N // 2),
+                       device="cuda", dtype=torch.uint8)
+
+    # Block scales: one fp8 scale per 16 FP4 elements along K dimension
+    w1_scale_raw = torch.randn(
+        (num_local_experts, 2 * N, K // 16),
+        device="cuda", dtype=torch.float32,
+    ).abs().clamp(min=0.01).to(torch.float8_e4m3fn)
+
+    w2_scale_raw = torch.randn(
+        (num_local_experts, K, N // 16),
+        device="cuda", dtype=torch.float32,
+    ).abs().clamp(min=0.01).to(torch.float8_e4m3fn)
+
+    # Swizzle block scales for CuteDSL kernel layout
+    w1_scale = swizzle_blockscale(w1_scale_raw)
+    w2_scale = swizzle_blockscale(w2_scale_raw)
+
+    return w1, w2, w1_scale, w2_scale
+
+
+def make_nvfp4_quant_config(num_local_experts, w1_scale, w2_scale):
+    """Create nvfp4 quant config with synthetic global scales."""
+    # Per-expert global scales (positive)
+    a13_scale = torch.rand(num_local_experts, device="cuda", dtype=torch.float32) + 0.5
+    a2_scale = torch.rand(num_local_experts, device="cuda", dtype=torch.float32) + 0.5
+    w13_scale_2 = torch.rand(num_local_experts, device="cuda", dtype=torch.float32) + 0.5
+    w2_scale_2 = torch.rand(num_local_experts, device="cuda", dtype=torch.float32) + 0.5
+
+    g1_alphas = a13_scale * w13_scale_2
+    g2_alphas = a2_scale * w2_scale_2
+    a1_gscale = 1.0 / a13_scale
+    a2_gscale = 1.0 / a2_scale
+
+    return nvfp4_moe_quant_config(
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
+        a1_gscale=a1_gscale,
+        a2_gscale=a2_gscale,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        is_nvfp4_scale_swizzled=True,
+    )
+
+
+def make_moe_layer(buffer, world_size, max_tokens_per_rank, num_local_experts,
+                    moe_config):
+    """Create one full MoE layer: a2a + experts + weights + kernel."""
+    a2a = DeepEPLLPrepareAndFinalize(
+        buffer=buffer,
+        num_dispatchers=world_size,
+        max_tokens_per_rank=max_tokens_per_rank,
+        use_fp8_dispatch=False,  # NVFP4 dispatch replaces FP8
+    )
+
+    w1, w2, w1_scale, w2_scale = make_nvfp4_weights(
+        num_local_experts, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+    )
+    quant_config = make_nvfp4_quant_config(num_local_experts, w1_scale, w2_scale)
+
+    experts = FlashInferCuteDSLExperts(
+        moe_config=moe_config,
+        quant_config=quant_config,
+        max_num_tokens=max_tokens_per_rank,
+        num_dispatchers=world_size,
+    )
+
+    mk = FusedMoEKernel(
+        prepare_finalize=a2a,
+        fused_experts=experts,
+        inplace=False,
+    )
+
+    return mk, w1, w2
 
 
 class DeepEPTestHarness:
@@ -94,26 +188,28 @@ class DeepEPTestHarness:
 
         self.num_local_experts = NUM_EXPERTS // self.world_size
 
-        self.w1, self.w2 = make_weights(self.num_local_experts, INTERMEDIATE_SIZE, HIDDEN_SIZE)
-
         self.expert_map = torch.full((NUM_EXPERTS,), fill_value=-1, dtype=torch.int32)
         e_start = self.rank * self.num_local_experts
         e_end = e_start + self.num_local_experts
         self.expert_map[e_start:e_end] = torch.arange(self.num_local_experts, dtype=torch.int32)
         self.expert_map = self.expert_map.to(device=self.device)
 
-        a2a = make_deepep_ll_a2a(
+        moe_config = make_moe_config()
+        buffer, a2a = make_deepep_ll_a2a(
             pg=self.pg, world_size=self.world_size,
             num_experts=NUM_EXPERTS,
             max_tokens_per_rank=self.max_tokens_per_rank,
             hidden_size=HIDDEN_SIZE,
-            use_fp8_dispatch=True,
         )
 
-        quant_config = FusedMoEQuantConfig.make(None)
-        moe_config = make_dummy_moe_config()
+        self.w1, self.w2, w1_scale, w2_scale = make_nvfp4_weights(
+            self.num_local_experts, INTERMEDIATE_SIZE, HIDDEN_SIZE,
+        )
+        quant_config = make_nvfp4_quant_config(
+            self.num_local_experts, w1_scale, w2_scale,
+        )
 
-        fused_experts = BatchedTritonExperts(
+        fused_experts = FlashInferCuteDSLExperts(
             max_num_tokens=self.max_tokens_per_rank,
             num_dispatchers=self.world_size,
             moe_config=moe_config,
@@ -203,32 +299,20 @@ class ChainedMoEHarness:
             num_qps_per_rank=self.num_local_experts,
         )
 
-        quant_config = FusedMoEQuantConfig.make(None)
-        moe_config = make_dummy_moe_config()
+        moe_config = make_moe_config()
 
         # Each layer gets its own a2a, experts, weights, and kernel
         self.layers = []
         self.all_w1 = []
         self.all_w2 = []
         for _ in range(num_layers):
-            a2a = DeepEPLLPrepareAndFinalize(
+            mk, w1, w2 = make_moe_layer(
                 buffer=self.shared_buffer,
-                num_dispatchers=self.world_size,
+                world_size=self.world_size,
                 max_tokens_per_rank=max_tokens_per_rank,
-                use_fp8_dispatch=True,
-            )
-            experts = BatchedTritonExperts(
-                max_num_tokens=max_tokens_per_rank,
-                num_dispatchers=self.world_size,
+                num_local_experts=self.num_local_experts,
                 moe_config=moe_config,
-                quant_config=quant_config,
             )
-            mk = FusedMoEKernel(
-                prepare_finalize=a2a,
-                fused_experts=experts,
-                inplace=False,
-            )
-            w1, w2 = make_weights(self.num_local_experts, INTERMEDIATE_SIZE, HIDDEN_SIZE)
             self.layers.append(mk)
             self.all_w1.append(w1)
             self.all_w2.append(w2)
