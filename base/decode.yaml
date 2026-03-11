@@ -1,0 +1,221 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: wide-ep-decode
+  labels:
+    llm-d.ai/role: testing
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 4
+    workerTemplate:
+      metadata:
+        labels:
+          llm-d.ai/role: testing
+      spec:
+        serviceAccountName: wide-ep
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 2Gi
+          - name: lustre
+            persistentVolumeClaim:
+              claimName: lustre-pvc-vllm
+        resourceClaims:
+          - name: compute-domain-channel
+            resourceClaimTemplateName: llm-d-dev-claim
+        containers:
+          - name: vllm
+            image: quay.io/rh-ee-ecrncevi/llm-dev-cuda13:v0.5.0-arm64-upstream-106ff69c4eb4921d33341a96b9c3d6db9d12ba76
+            securityContext:
+              capabilities:
+                add:
+                  - IPC_LOCK
+                  - SYS_RAWIO
+              runAsGroup: 0
+              runAsUser: 0
+            imagePullPolicy: Always
+            command:
+              - /bin/bash
+              - -c
+            args:
+              - |-
+                set -e
+                #################
+                # Distributed EP16 test runner (loops)
+                # 4 nodes × 4 GPUs = 16 ranks
+                # Waits for .ready sentinel, runs all tests, deletes sentinel, repeats.
+                # To re-run: just rerun-testing
+                #################
+
+                LOG_DIR="/mnt/lustre/vllm-vlm-elvircrn/logs/testing"
+                mkdir -p $LOG_DIR
+                LOG_FILE="$LOG_DIR/${HOSTNAME}_$(date +%Y%m%d_%H%M%S).log"
+                exec > >(tee -a "$LOG_FILE") 2>&1
+                echo "=== Test runner starting at $(date) ==="
+                echo "LWS_WORKER_INDEX=${LWS_WORKER_INDEX:-0} LWS_GROUP_SIZE=${LWS_GROUP_SIZE:-1}"
+                echo "LEADER=${LWS_LEADER_ADDRESS:-localhost}"
+
+                TEST_DIR="${TEST_DIR:-/mnt/lustre/vllm-vlm-elvircrn/tests}"
+                SENTINEL="$TEST_DIR/.ready"
+                NNODES=${LWS_GROUP_SIZE:-1}
+                NODE_RANK=${LWS_WORKER_INDEX:-0}
+                MASTER_ADDR=${LWS_LEADER_ADDRESS:-localhost}
+                BASE_PORT=${MASTER_PORT:-29500}
+                NPROC=${NPROC_PER_NODE:-4}
+                RUN=0
+
+                cd /opt/vllm-source
+
+                while true; do
+                  echo ""
+                  echo "Waiting for test scripts (sentinel: $SENTINEL)..."
+                  while [ ! -f "$SENTINEL" ]; do
+                    sleep 2
+                  done
+
+                  RUN=$((RUN + 1))
+                  echo ""
+                  echo "########################################################"
+                  echo "# RUN $RUN at $(date)"
+                  echo "########################################################"
+
+                  # Consume the sentinel so we don't re-trigger
+                  rm -f "$SENTINEL"
+
+                  TESTS=$(ls "$TEST_DIR"/test_*.py 2>/dev/null | sort)
+                  N_TESTS=$(echo "$TESTS" | wc -l)
+                  echo "Found $N_TESTS test(s) in $TEST_DIR"
+
+                  FAILED=0
+                  PORT=$((BASE_PORT + (RUN * 100)))
+                  for TEST_SCRIPT in $TESTS; do
+                    TEST_NAME=$(basename "$TEST_SCRIPT")
+                    echo ""
+                    echo "============================================================"
+                    echo ">>> $TEST_NAME (port=$PORT)"
+                    echo "============================================================"
+
+                    torchrun \
+                      --nnodes=$NNODES \
+                      --node-rank=$NODE_RANK \
+                      --nproc-per-node=$NPROC \
+                      --master-addr=$MASTER_ADDR \
+                      --master-port=$PORT \
+                      "$TEST_SCRIPT" $TEST_ARGS
+
+                    RC=$?
+                    if [ $RC -ne 0 ]; then
+                      echo "*** $TEST_NAME FAILED (exit code $RC) ***"
+                      FAILED=$((FAILED + 1))
+                    else
+                      echo "--- $TEST_NAME PASSED ---"
+                    fi
+
+                    PORT=$((PORT + 1))
+                  done
+
+                  echo ""
+                  echo "============================================================"
+                  echo "RUN $RUN DONE: $((N_TESTS - FAILED))/$N_TESTS passed, $FAILED failed"
+                  echo "============================================================"
+                done
+
+            env:
+              - name: VLLM_DEV_VENV
+                value: ""
+
+              # NVFP4 dispatch + masked_gemm (matches production)
+              - name: VLLM_DEEPEPLL_NVFP4_DISPATCH
+                value: "1"
+              - name: VLLM_FLASHINFER_MOE_BACKEND
+                value: "masked_gemm"
+
+              # Test directory on Lustre (override via kustomize patch)
+              - name: TEST_DIR
+                value: "/mnt/lustre/vllm-vlm-elvircrn/tests"
+
+              # Extra args passed to each test script
+              - name: TEST_ARGS
+                value: ""
+
+              # torchrun config
+              - name: NPROC_PER_NODE
+                value: "4"
+              - name: MASTER_PORT
+                value: "29500"
+
+              # JIT build parallelism
+              - name: MAX_JOBS
+                value: "64"
+              - name: CMAKE_BUILD_PARALLEL_LEVEL
+                value: "64"
+              - name: MAKEFLAGS
+                value: "-j64"
+              - name: NVCC_THREADS
+                value: "64"
+              - name: CUDA_HOME
+                value: "/usr/local/cuda-13"
+
+              # HuggingFace
+              - name: HF_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-secret
+                    key: HF_TOKEN
+                    optional: true
+              - name: HF_HOME
+                value: /mnt/lustre/vllm-vlm-elvircrn
+              - name: TRANSFORMERS_CACHE
+                value: /mnt/lustre/vllm-vlm-elvircrn
+              - name: HF_HUB_CACHE
+                value: /mnt/lustre/vllm-vlm-elvircrn
+
+              # Compile caches
+              - name: VLLM_CACHE_ROOT
+                value: /mnt/lustre/vllm-vlm-elvircrn/vllm_cache
+              - name: FLASHINFER_CACHE_DIR
+                value: /mnt/lustre/vllm-vlm-elvircrn/flashinfer_cache
+
+              # DeepEP / NVSHMEM
+              - name: VLLM_DEEPEP_LOW_LATENCY_USE_MNNVL
+                value: "1"
+
+              - name: NVSHMEM_CUMEM_HANDLE_TYPE
+                value: FABRIC
+              - name: NVSHMEM_DISABLE_CUDA_VMM
+                value: "0"
+
+              # Common vLLM settings
+              - name: TRITON_LIBCUDA_PATH
+                value: /usr/lib64
+              - name: VLLM_USE_DEEP_GEMM
+                value: "1"
+              - name: NVIDIA_GDRCOPY
+                value: enabled
+
+              - name: UCX_NET_DEVICES
+                value: "mlx5_0:1,mlx5_1:1"
+
+              - name: VLLM_LOGGING_LEVEL
+                value: INFO
+
+            resources:
+              claims:
+                - name: compute-domain-channel
+              limits:
+                ephemeral-storage: 128Gi
+                memory: 512Gi
+                nvidia.com/gpu: "4"
+              requests:
+                cpu: 32
+                ephemeral-storage: 128Gi
+                memory: 512Gi
+                nvidia.com/gpu: "4"
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /mnt/lustre/vllm-vlm-elvircrn
+                name: lustre
+            workingDir: /opt/vllm-source
