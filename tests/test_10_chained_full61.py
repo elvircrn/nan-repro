@@ -3,27 +3,26 @@
 Test 10: Full 61-layer chained MoE — matches DeepSeek-R1 (layers 3-63).
 All 61 layers share one deep_ep.Buffer, each with its own
 DeepEPLLPrepareAndFinalize (and thus its own handles[] state).
-bs=64 to keep memory manageable. 100 replays.
+NVFP4 + FlashInfer CuteDSL masked_gemm + NVFP4 dispatch.
 
-This is the closest to production: if buffer aliasing or handle
-state corruption requires 61 layers to manifest, this will catch it.
+bs=1024, runs indefinitely until NaN is found.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
+import time
 import torch
 from deepep_test_helpers import *
 
-BATCH_SIZE = 64
+BATCH_SIZE = 1024
 NUM_LAYERS = 61  # DeepSeek-R1: layers 3-63 are MoE
-REPLAYS = 100
 
 
 def main():
     h = ChainedMoEHarness(num_layers=NUM_LAYERS, max_tokens_per_rank=BATCH_SIZE)
 
     with h.vllm_ctx:
-        h.log(f"\n=== Full 61-layer chain: bs={BATCH_SIZE}, {REPLAYS} replays ===")
+        h.log(f"\n=== Full 61-layer chain: bs={BATCH_SIZE}, running until NaN ===")
         h.log(f"Created {NUM_LAYERS} layers, each with own a2a, sharing 1 buffer")
 
         input_buf = torch.randn(BATCH_SIZE, HIDDEN_SIZE, device=h.device, dtype=torch.bfloat16) / 10
@@ -33,12 +32,14 @@ def main():
         h.log("Warming up...")
         h.warmup(input_buf, topk_ids, topk_w)
 
-        h.log(f"Capturing CUDA graph with {NUM_LAYERS} chained layers...")
+        h.log(f"Capturing CUDA graph with {NUM_LAYERS} chained layers at bs={BATCH_SIZE}...")
         graph, graph_out = h.capture_graph(input_buf, topk_ids, topk_w)
-        h.log("Graph captured. Replaying...")
+        h.log("Graph captured. Replaying until NaN...")
 
         nan_count = 0
-        for i in range(REPLAYS):
+        i = 0
+        t0 = time.time()
+        while True:
             input_buf.copy_(torch.randn(BATCH_SIZE, HIDDEN_SIZE, device=h.device, dtype=torch.bfloat16) / 10)
             topk_ids.copy_(torch.randint(0, NUM_EXPERTS, (BATCH_SIZE, TOPK), device=h.device, dtype=torch.int64))
 
@@ -47,19 +48,24 @@ def main():
 
             if graph_out.isnan().any().item() or graph_out.isinf().any().item():
                 nan_count += 1
-                if nan_count <= 5:
-                    nc = graph_out.isnan().sum().item()
-                    h.log_err(f"REPLAY {i}: NaN={nc}/{graph_out.numel()}")
-            elif i % 20 == 0:
-                h.log(f"  Replay {i}/{REPLAYS}: OK")
+                nc = graph_out.isnan().sum().item()
+                ic = graph_out.isinf().sum().item()
+                h.log_all(f"REPLAY {i}: NaN={nc} Inf={ic} / {graph_out.numel()}")
+                if nan_count >= 10:
+                    h.log_all(f"STOPPING after {nan_count} NaN in {i+1} replays")
+                    break
+            elif i % 100 == 0:
+                elapsed = time.time() - t0
+                h.log(f"  Replay {i}: OK ({elapsed:.1f}s elapsed, {nan_count} NaN so far)")
 
-        h.log_all(f"Full 61-layer chain: {nan_count}/{REPLAYS} NaN")
-        if nan_count > 0:
-            h.teardown()
-            sys.exit(1)
+            i += 1
 
-    h.log_all("PASS")
+        elapsed = time.time() - t0
+        h.log_all(f"Full 61-layer chain bs={BATCH_SIZE}: {nan_count} NaN in {i+1} replays ({elapsed:.1f}s)")
+
     h.teardown()
+    if nan_count > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
