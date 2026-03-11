@@ -2,8 +2,7 @@
 """
 Test 7: Chained MoE layers with fixed batch — tests 2, 4, 8, 16 layers.
 Each layer's output feeds the next. All layers share one deep_ep.Buffer.
-Uses NVFP4 + FlashInfer CuteDSL masked_gemm + fp8 dispatch (production path).
-Tests whether buffer reuse / handle state across layers causes NaN.
+Uses NVFP4 + FlashInfer CuteDSL masked_gemm (production path).
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
@@ -38,6 +37,14 @@ def main():
     expert_map = expert_map.to(device=device)
 
     moe_config = make_moe_config()
+
+    # Single buffer for the entire process (NVSHMEM is a singleton)
+    num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
+        BATCH_SIZE, HIDDEN_SIZE, world_size, NUM_EXPERTS)
+    shared_buffer = deep_ep.Buffer(
+        group=pg, num_rdma_bytes=num_rdma_bytes,
+        low_latency_mode=True, num_qps_per_rank=num_local_experts)
+
     total_fails = 0
 
     for n_layers in LAYER_COUNTS:
@@ -46,14 +53,6 @@ def main():
             if rank == 0:
                 print(f"\n=== Chained fixed: {n_layers} layers, bs={BATCH_SIZE}, {REPLAYS} replays ===", flush=True)
 
-            # Create shared buffer
-            num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
-                BATCH_SIZE, HIDDEN_SIZE, world_size, NUM_EXPERTS)
-            shared_buffer = deep_ep.Buffer(
-                group=pg, num_rdma_bytes=num_rdma_bytes,
-                low_latency_mode=True, num_qps_per_rank=num_local_experts)
-
-            # Per-layer: a2a + FlashInfer CuteDSL experts + nvfp4 weights
             layers = []
             all_w1 = []
             all_w2 = []
@@ -81,12 +80,10 @@ def main():
                         expert_map=expert_map, apply_router_weight_on_input=False)
                 return x
 
-            # Warmup
             for _ in range(3):
                 chain_forward()
             torch.cuda.synchronize()
 
-            # Capture
             if rank == 0:
                 print(f"Capturing CUDA graph with {n_layers} chained layers...", flush=True)
             graph = torch.cuda.CUDAGraph()
@@ -94,7 +91,6 @@ def main():
                 graph_out = chain_forward()
             torch.cuda.synchronize()
 
-            # Replay
             nan_count = 0
             for i in range(REPLAYS):
                 input_buf.copy_(torch.randn(BATCH_SIZE, HIDDEN_SIZE, device=device, dtype=torch.bfloat16) / 10)
@@ -115,7 +111,7 @@ def main():
             if nan_count > 0:
                 total_fails += 1
 
-            del graph, graph_out, layers, all_w1, all_w2, shared_buffer
+            del graph, graph_out, layers, all_w1, all_w2
             torch.cuda.empty_cache()
 
     torch.distributed.destroy_process_group()
