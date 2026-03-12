@@ -1,13 +1,13 @@
 apiVersion: leaderworkerset.x-k8s.io/v1
 kind: LeaderWorkerSet
 metadata:
-  name: wide-ep-decode
+  name: wide-ep-testing
   labels:
     llm-d.ai/role: testing
 spec:
   replicas: 1
   leaderWorkerTemplate:
-    size: 4
+    size: 1
     workerTemplate:
       metadata:
         labels:
@@ -43,8 +43,8 @@ spec:
               - |-
                 set -e
                 #################
-                # Distributed EP16 test runner (loops)
-                # 4 nodes × 4 GPUs = 16 ranks
+                # Single-GPU test runner (loops)
+                # 1 node × 1 GPU — attention tests don't need distributed
                 # Waits for .ready sentinel, runs all tests, deletes sentinel, repeats.
                 # To re-run: just rerun-testing
                 #################
@@ -54,19 +54,22 @@ spec:
                 LOG_FILE="$LOG_DIR/${HOSTNAME}_$(date +%Y%m%d_%H%M%S).log"
                 exec > >(tee -a "$LOG_FILE") 2>&1
                 echo "=== Test runner starting at $(date) ==="
-                echo "LWS_WORKER_INDEX=${LWS_WORKER_INDEX:-0} LWS_GROUP_SIZE=${LWS_GROUP_SIZE:-1}"
-                echo "LEADER=${LWS_LEADER_ADDRESS:-localhost}"
 
                 TEST_DIR="${TEST_DIR:-/mnt/lustre/vllm-vlm-elvircrn/tests}"
                 SENTINEL="$TEST_DIR/.ready"
-                NNODES=${LWS_GROUP_SIZE:-1}
-                NODE_RANK=${LWS_WORKER_INDEX:-0}
-                MASTER_ADDR=${LWS_LEADER_ADDRESS:-localhost}
-                BASE_PORT=${MASTER_PORT:-29500}
-                NPROC=${NPROC_PER_NODE:-4}
                 RUN=0
 
                 cd /opt/vllm-source
+
+                # Checkout same branch as production decode pods (has FlashInfer MLA + NaN harness)
+                if ! git remote | grep -q fork; then
+                  git remote add fork https://github.com/elvircrn/vllm.git
+                fi
+                git fetch fork nan-harness-a2a
+                git checkout fork/nan-harness-a2a
+
+                # Install test dependencies (pytest needed by vLLM test utils)
+                uv pip install pytest
 
                 while true; do
                   echo ""
@@ -81,30 +84,22 @@ spec:
                   echo "# RUN $RUN at $(date)"
                   echo "########################################################"
 
-                  # Consume the sentinel so we don't re-trigger
+                  sleep 5
                   rm -f "$SENTINEL"
 
-                  TESTS=$(ls "$TEST_DIR"/test_*.py 2>/dev/null | sort)
-                  N_TESTS=$(echo "$TESTS" | wc -l)
+                  ALL_TESTS=$(ls "$TEST_DIR"/test_*.py "$TEST_DIR"/serve_*.py 2>/dev/null | sort)
+                  N_TESTS=$(echo $ALL_TESTS | wc -w)
                   echo "Found $N_TESTS test(s) in $TEST_DIR"
 
                   FAILED=0
-                  PORT=$((BASE_PORT + (RUN * 100)))
-                  for TEST_SCRIPT in $TESTS; do
+                  for TEST_SCRIPT in $ALL_TESTS; do
                     TEST_NAME=$(basename "$TEST_SCRIPT")
                     echo ""
                     echo "============================================================"
-                    echo ">>> $TEST_NAME (port=$PORT)"
+                    echo ">>> $TEST_NAME"
                     echo "============================================================"
 
-                    torchrun \
-                      --nnodes=$NNODES \
-                      --node-rank=$NODE_RANK \
-                      --nproc-per-node=$NPROC \
-                      --master-addr=$MASTER_ADDR \
-                      --master-port=$PORT \
-                      "$TEST_SCRIPT" $TEST_ARGS
-
+                    python "$TEST_SCRIPT" $TEST_ARGS
                     RC=$?
                     if [ $RC -ne 0 ]; then
                       echo "*** $TEST_NAME FAILED (exit code $RC) ***"
@@ -112,8 +107,6 @@ spec:
                     else
                       echo "--- $TEST_NAME PASSED ---"
                     fi
-
-                    PORT=$((PORT + 1))
                   done
 
                   echo ""
@@ -142,7 +135,7 @@ spec:
 
               # torchrun config
               - name: NPROC_PER_NODE
-                value: "4"
+                value: "1"
               - name: MASTER_PORT
                 value: "29500"
 
@@ -198,6 +191,9 @@ spec:
               - name: UCX_NET_DEVICES
                 value: "mlx5_0:1,mlx5_1:1"
 
+              - name: VLLM_ATTENTION_BACKEND
+                value: CUTLASS_MLA
+
               - name: VLLM_LOGGING_LEVEL
                 value: INFO
 
@@ -207,12 +203,12 @@ spec:
               limits:
                 ephemeral-storage: 128Gi
                 memory: 512Gi
-                nvidia.com/gpu: "4"
+                nvidia.com/gpu: "1"
               requests:
                 cpu: 32
                 ephemeral-storage: 128Gi
                 memory: 512Gi
-                nvidia.com/gpu: "4"
+                nvidia.com/gpu: "1"
             volumeMounts:
               - mountPath: /dev/shm
                 name: dshm

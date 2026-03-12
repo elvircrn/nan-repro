@@ -5,7 +5,7 @@ resources:
 patches:
   - target:
       kind: LeaderWorkerSet
-      name: wide-ep-decode
+      name: wide-ep-testing
     patch: |-
       - op: add
         path: /metadata/labels/llm-d.ai~1deployment
